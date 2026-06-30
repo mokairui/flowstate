@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(npm install *)",
+      "PowerShell(npx next build 2>&1)",
+      "PowerShell(npm *)",
+      "PowerShell(npx tsc --noEmit 2>&1)",
+      "PowerShell(node -v)",
+      "PowerShell(npx next dev 2>&1)"
+    ]
+  }
+}
