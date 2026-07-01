@@ -20,8 +20,19 @@ import {
 } from "lucide-react";
 import { v4 as uuidv4 } from "uuid";
 import { useFlowState } from "@/lib/store";
-import { addTodo, updateTodo } from "@/lib/db";
-import { parseTodoWithAi, applyAiResultToTodo, truncateError, streamChat, generateSubtasksForTodo, type ChatMessage } from "@/lib/ai";
+import { addTodo, updateTodo, getNextOrderForStatus } from "@/lib/db";
+import {
+  parseTodoWithAi,
+  applyAiResultToTodo,
+  truncateError,
+  streamChat,
+  generateSubtasksForTodo,
+  type ChatMessage,
+  type ChatContext,
+  type ChatTodoRef,
+  type AiAction,
+  type ExecutedAction,
+} from "@/lib/ai";
 import { useSpeechRecognition } from "@/lib/useSpeechRecognition";
 import { useScrollLock } from "@/lib/useScrollLock";
 import { parseQuickDateShortcuts } from "@/lib/date-utils";
@@ -45,6 +56,7 @@ export default function QuickCapture() {
     openQuickCapture,
     addTodo: addTodoToStore,
     updateTodo: updateInStore,
+    openDetail,
     showToast,
     quickCaptureDraft,
     setQuickCaptureDraft,
@@ -166,6 +178,102 @@ export default function QuickCapture() {
     }
   }, [isQuickCaptureOpen, isListening, stopSpeech]);
 
+  // Execute AI-emitted actions sequentially; each item isolated by try/catch.
+  const executeAiActions = useCallback(
+    async (actions: AiAction[]): Promise<ExecutedAction[]> => {
+      const executed: ExecutedAction[] = [];
+      const validStatuses: TodoStatus[] = ["inbox", "today", "doing", "done", "archived"];
+
+      for (const action of actions) {
+        try {
+          if (action.type === "complete_todo") {
+            const target = todos.find((t) => t.id === action.id);
+            if (!target) throw new Error(`任务不存在: ${action.id}`);
+            const changes = { status: "done" as TodoStatus, completedAt: Date.now() };
+            await updateTodo(target.id, changes);
+            updateInStore(target.id, changes);
+            executed.push({
+              type: action.type,
+              todoId: target.id,
+              title: target.title,
+              status: "done",
+              ok: true,
+            });
+          } else if (action.type === "move_to_status") {
+            const target = todos.find((t) => t.id === action.id);
+            if (!target) throw new Error(`任务不存在: ${action.id}`);
+            if (!validStatuses.includes(action.status)) {
+              throw new Error(`非法状态: ${action.status}`);
+            }
+            const order = await getNextOrderForStatus(action.status);
+            const changes: Partial<TodoItem> = { status: action.status, order };
+            if (action.status === "done") changes.completedAt = Date.now();
+            await updateTodo(target.id, changes);
+            updateInStore(target.id, changes);
+            executed.push({
+              type: action.type,
+              todoId: target.id,
+              title: target.title,
+              status: action.status,
+              ok: true,
+            });
+          } else if (action.type === "create_todo") {
+            if (!action.title || !action.title.trim()) {
+              throw new Error("create_todo 缺少 title");
+            }
+            const nextStatus: TodoStatus =
+              action.status && validStatuses.includes(action.status) ? action.status : "inbox";
+            const now = Date.now();
+            const order = await getNextOrderForStatus(nextStatus);
+            const todo: TodoItem = {
+              id: uuidv4(),
+              title: action.title.trim(),
+              rawInput: action.title.trim(),
+              status: nextStatus,
+              priority: action.priority ?? "medium",
+              tags: action.tags ?? [],
+              source: "ai_chat",
+              order,
+              createdAt: now,
+              updatedAt: now,
+              aiStatus: "idle",
+            };
+            await addTodo(todo);
+            addTodoToStore(todo);
+            executed.push({
+              type: action.type,
+              todoId: todo.id,
+              title: todo.title,
+              status: nextStatus,
+              ok: true,
+            });
+          } else if (action.type === "recommend") {
+            const target = todos.find((t) => t.id === action.id);
+            if (!target) throw new Error(`任务不存在: ${action.id}`);
+            openDetail(target.id);
+            executed.push({
+              type: action.type,
+              todoId: target.id,
+              title: target.title,
+              ok: true,
+            });
+          }
+        } catch (err) {
+          executed.push({
+            type: action.type,
+            todoId: "id" in action ? action.id : undefined,
+            title: "title" in action ? action.title : undefined,
+            ok: false,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
+      }
+
+      return executed;
+    },
+    [todos, updateInStore, addTodoToStore, openDetail]
+  );
+
   // Send chat message
   const sendChatMessage = useCallback(
     async (content: string) => {
@@ -183,6 +291,21 @@ export default function QuickCapture() {
 
       const selectedTodo = todos.find((t) => t.id === selectedTodoId);
 
+      const toRef = (t: TodoItem): ChatTodoRef => ({
+        id: t.id,
+        title: t.title,
+        status: t.status,
+        priority: t.priority,
+        tags: t.tags,
+      });
+      const chatContext: ChatContext = {
+        inboxTodos: todos.filter((t) => t.status === "inbox").map(toRef),
+        todayTodos: todos.filter((t) => t.status === "today").map(toRef),
+        doingTodos: todos.filter((t) => t.status === "doing").map(toRef),
+        selectedTodoTitle: selectedTodo?.title,
+        energyMode: settings.userEnergyMode ?? null,
+      };
+
       try {
         let accumulated = "";
         await streamChat(
@@ -191,12 +314,45 @@ export default function QuickCapture() {
           {
             onChunk: (chunk, isDone) => {
               if (isDone) {
-                setIsStreaming(false);
-                setChatMessages((prev) => [
-                  ...prev,
-                  { role: "assistant", content: accumulated },
-                ]);
-                setStreamingContent("");
+                // Parse + execute any flowstate-action block, then finalize the assistant message.
+                void (async () => {
+                  const match = accumulated.match(/```flowstate-action\s*([\s\S]*?)```/);
+                  const cleaned = accumulated
+                    .replace(/```flowstate-action[\s\S]*?```/, "")
+                    .trim();
+                  let executed: ExecutedAction[] = [];
+                  if (match) {
+                    try {
+                      const parsed = JSON.parse(match[1]);
+                      if (Array.isArray(parsed)) {
+                        executed = await executeAiActions(parsed as AiAction[]);
+                      } else {
+                        throw new Error("指令不是数组");
+                      }
+                    } catch (err) {
+                      showToast(
+                        `AI 指令解析失败: ${
+                          err instanceof Error ? err.message : String(err)
+                        }`,
+                        "error"
+                      );
+                    }
+                  }
+                  setChatMessages((prev) => [
+                    ...prev,
+                    {
+                      role: "assistant",
+                      content: cleaned || accumulated,
+                      executedActions: executed.length ? executed : undefined,
+                    },
+                  ]);
+                  setStreamingContent("");
+                  setIsStreaming(false);
+                  const okCount = executed.filter((e) => e.ok).length;
+                  const failCount = executed.length - okCount;
+                  if (okCount > 0) showToast(`已执行 ${okCount} 个操作`, "success");
+                  if (failCount > 0) showToast(`${failCount} 个操作失败`, "error");
+                })();
               } else {
                 accumulated += chunk;
                 setStreamingContent(accumulated);
@@ -208,18 +364,7 @@ export default function QuickCapture() {
             },
           },
           chatAbortRef.current.signal,
-          {
-            todos: todos
-              .filter((t) => t.status === "today" || t.status === "doing")
-              .map((t) => ({
-                title: t.title,
-                status: t.status,
-                priority: t.priority,
-                energyLevel: t.energyLevel,
-              })),
-            selectedTodoTitle: selectedTodo?.title,
-            energyMode: settings.userEnergyMode,
-          }
+          chatContext
         );
       } catch {
         setIsStreaming(false);
@@ -227,7 +372,7 @@ export default function QuickCapture() {
         chatAbortRef.current = null;
       }
     },
-    [chatMessages, isStreaming, settings, todos, selectedTodoId, showToast]
+    [chatMessages, isStreaming, settings, todos, selectedTodoId, showToast, executeAiActions]
   );
 
   // Keep ref in sync for space-to-talk handler
@@ -1046,6 +1191,7 @@ export default function QuickCapture() {
                         streamingContent={streamingContent}
                         selectedTodoId={selectedTodoId}
                         onAction={handleChatAction}
+                        onOpenDetail={openDetail}
                       />
                       <div ref={messagesEndRef} />
                     </div>

@@ -1,6 +1,6 @@
 export type TodoStatus = "inbox" | "today" | "doing" | "done" | "archived" | "error";
 export type TodoPriority = "low" | "medium" | "high";
-export type TodoSource = "text" | "voice" | "ai_split";
+export type TodoSource = "text" | "voice" | "ai_split" | "ai_chat";
 export type AiProcessStatus = "idle" | "processing" | "success" | "error";
 export type EnergyLevel = "high" | "medium" | "low";
 

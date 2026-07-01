@@ -6,6 +6,7 @@ import type {
   EnergyLevel,
   SubtaskItem,
   TodoItem,
+  TodoStatus,
 } from "./types";
 
 export interface AiParseResultItem {
@@ -362,6 +363,7 @@ export function extractContent(data: unknown): string | null {
 export interface ChatMessage {
   role: "system" | "user" | "assistant";
   content: string;
+  executedActions?: ExecutedAction[];
 }
 
 export interface StreamChatCallbacks {
@@ -369,20 +371,111 @@ export interface StreamChatCallbacks {
   onError?: (error: string) => void;
 }
 
-function buildChatSystemPrompt(todos: { title: string; status: string; priority: string; energyLevel?: string }[], selectedTodoTitle?: string, energyMode?: string | null): string {
-  const todayCount = todos.filter((t) => t.status === "today" || t.status === "doing").length;
-  const highPriority = todos.filter((t) => t.priority === "high" && (t.status === "today" || t.status === "doing"));
-  let prompt = `你是 FlowState 的 AI 助手。用户正在使用一款本地优先的待办管理应用。请用中文回答，简洁友好。\n\n当前任务概况：\n- Today/Doing 共 ${todayCount} 个任务\n`;
+// -------- Chat-driven task actions --------
+
+export type ChatTodoRef = {
+  id: string;
+  title: string;
+  status: TodoStatus;
+  priority?: TodoPriority;
+  tags?: string[];
+};
+
+export interface ChatContext {
+  inboxTodos: ChatTodoRef[];
+  todayTodos: ChatTodoRef[];
+  doingTodos: ChatTodoRef[];
+  selectedTodoTitle?: string;
+  energyMode?: EnergyLevel | null;
+}
+
+export type AiAction =
+  | { type: "complete_todo"; id: string }
+  | { type: "move_to_status"; id: string; status: TodoStatus }
+  | {
+      type: "create_todo";
+      title: string;
+      status?: TodoStatus;
+      priority?: TodoPriority;
+      tags?: string[];
+    }
+  | { type: "recommend"; id: string; reason?: string };
+
+export type ExecutedAction = {
+  type: AiAction["type"];
+  todoId?: string;
+  title?: string;
+  ok: boolean;
+  error?: string;
+  status?: TodoStatus;
+};
+
+const MAX_LIST = 20;
+
+function formatTodoLine(t: ChatTodoRef): string {
+  const p = t.priority ? `, P-${t.priority}` : "";
+  return `- [id=${t.id}] (${t.status}${p}) ${t.title}`;
+}
+
+function formatTodoBlock(label: string, list: ChatTodoRef[]): string {
+  if (list.length === 0) return `${label}：（无）\n`;
+  const truncated = list.length > MAX_LIST;
+  const rows = list.slice(0, MAX_LIST).map(formatTodoLine).join("\n");
+  const note = truncated ? `（仅列出最近 ${MAX_LIST} 条，共 ${list.length} 条）` : "";
+  return `${label}${note}：\n${rows}\n`;
+}
+
+function buildChatSystemPrompt(context: ChatContext | undefined): string {
+  const ctx: ChatContext = context ?? {
+    inboxTodos: [],
+    todayTodos: [],
+    doingTodos: [],
+  };
+
+  const totalTodayDoing = ctx.todayTodos.length + ctx.doingTodos.length;
+  const highPriority = [...ctx.todayTodos, ...ctx.doingTodos].filter(
+    (t) => t.priority === "high"
+  );
+
+  let prompt = `你是 FlowState 的 AI 助手。用户正在使用一款本地优先的待办管理应用。请用中文回答，简洁友好。\n\n当前任务概况：\n- Today/Doing 共 ${totalTodayDoing} 个任务\n`;
   if (highPriority.length > 0) {
     prompt += `- 高优先级任务：${highPriority.map((t) => t.title).join("、")}\n`;
   }
-  if (energyMode) {
-    prompt += `- 用户当前能量模式：${energyMode === "high" ? "高精力" : energyMode === "low" ? "低精力" : "正常"}\n`;
+  if (ctx.energyMode) {
+    prompt += `- 用户当前能量模式：${
+      ctx.energyMode === "high" ? "高精力" : ctx.energyMode === "low" ? "低精力" : "正常"
+    }\n`;
   }
-  if (selectedTodoTitle) {
-    prompt += `- 当前选中任务：${selectedTodoTitle}\n`;
+  if (ctx.selectedTodoTitle) {
+    prompt += `- 当前选中任务：${ctx.selectedTodoTitle}\n`;
   }
-  prompt += `\n你可以帮助用户分析任务、提供建议、回答关于任务的问题。不要编造不存在的信息。`;
+
+  prompt += `\n可操作任务清单（引用任务时**必须**使用下面的 id，不要引用未列出的 id）：\n`;
+  prompt += formatTodoBlock("Inbox", ctx.inboxTodos);
+  prompt += formatTodoBlock("Today", ctx.todayTodos);
+  prompt += formatTodoBlock("Doing", ctx.doingTodos);
+
+  prompt += `\n操作指令协议：
+- 你可以在自然语言回答之后，仅当需要执行操作时，在消息**结尾**追加一个 fenced code block，语言标注为 flowstate-action，内容是一个 JSON 数组，形如：
+
+\`\`\`flowstate-action
+[
+  {"type":"complete_todo","id":"<id>"},
+  {"type":"move_to_status","id":"<id>","status":"today"},
+  {"type":"create_todo","title":"...","status":"today","priority":"medium","tags":[]},
+  {"type":"recommend","id":"<id>","reason":"..."}
+]
+\`\`\`
+
+- \`status\` 取值仅限：inbox | today | doing | done | archived。
+- \`create_todo\` 中 \`title\` 必填，其余字段可省；缺省 \`status\` 视为 inbox。
+- 用户仅问建议时用 \`recommend\`（不会修改任务，只会在应用里高亮该任务）。
+- 不需要操作时**不要**输出该代码块。
+- 未在上方清单列出的 id 一律不要引用。
+- 该 code block 必须放在消息最后，且不要在其后再输出其他内容。
+
+你可以帮助用户分析任务、提供建议、回答关于任务的问题。不要编造不存在的信息。`;
+
   return prompt;
 }
 
@@ -391,7 +484,7 @@ export async function streamChat(
   settings: AppSettings,
   callbacks: StreamChatCallbacks,
   signal?: AbortSignal,
-  context?: { todos?: { title: string; status: string; priority: string; energyLevel?: string }[]; selectedTodoTitle?: string; energyMode?: string | null }
+  context?: ChatContext
 ): Promise<void> {
   if (!settings.aiEnabled) {
     callbacks.onError?.("AI 功能未启用");
@@ -403,11 +496,7 @@ export async function streamChat(
   }
 
   try {
-    const systemPrompt = buildChatSystemPrompt(
-      context?.todos || [],
-      context?.selectedTodoTitle,
-      context?.energyMode
-    );
+    const systemPrompt = buildChatSystemPrompt(context);
 
     const body: Record<string, unknown> = {
       model: settings.model || "gpt-4o-mini",

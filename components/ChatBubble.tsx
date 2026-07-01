@@ -1,8 +1,19 @@
 "use client";
 
 import { motion } from "framer-motion";
-import { Sparkles, User, Copy, CheckCircle2, ListTodo, ArrowRight } from "lucide-react";
-import type { ChatMessage } from "@/lib/ai";
+import {
+  Sparkles,
+  User,
+  Copy,
+  CheckCircle2,
+  ListTodo,
+  ArrowRight,
+  Check,
+  Plus,
+  Star,
+  XCircle,
+} from "lucide-react";
+import type { ChatMessage, ExecutedAction } from "@/lib/ai";
 import { useState } from "react";
 
 interface ChatBubbleProps {
@@ -11,6 +22,33 @@ interface ChatBubbleProps {
   streamingContent: string;
   selectedTodoId: string | null;
   onAction: (action: string) => void;
+  onOpenDetail?: (id: string) => void;
+}
+
+// Strip a (possibly half-written) flowstate-action fenced block from the streaming text.
+// The `(```|$)` alternate keeps a partial JSON hidden while the model is still emitting it.
+const ACTION_FENCE_STREAM = /```flowstate-action[\s\S]*?(```|$)/;
+
+function chipLabel(action: ExecutedAction): string {
+  const t = action.title ?? "";
+  switch (action.type) {
+    case "complete_todo":
+      return `✓ 完成${t ? ` · ${t}` : ""}`;
+    case "move_to_status":
+      return `↗ 移到 ${action.status ?? "?"}${t ? ` · ${t}` : ""}`;
+    case "create_todo":
+      return `＋ 已创建${t ? ` · ${t}` : ""}`;
+    case "recommend":
+      return `☆ 推荐${t ? ` · ${t}` : ""}`;
+  }
+}
+
+function ChipIcon({ type }: { type: ExecutedAction["type"] }) {
+  const cls = "h-2.5 w-2.5";
+  if (type === "complete_todo") return <Check className={cls} />;
+  if (type === "move_to_status") return <ArrowRight className={cls} />;
+  if (type === "create_todo") return <Plus className={cls} />;
+  return <Star className={cls} />;
 }
 
 export default function ChatBubble({
@@ -19,6 +57,7 @@ export default function ChatBubble({
   streamingContent,
   selectedTodoId,
   onAction,
+  onOpenDetail,
 }: ChatBubbleProps) {
   const [copiedId, setCopiedId] = useState<number | null>(null);
 
@@ -31,6 +70,8 @@ export default function ChatBubble({
       // ignore
     }
   };
+
+  const visibleStreaming = streamingContent.replace(ACTION_FENCE_STREAM, "").trimEnd();
 
   return (
     <div className="flex flex-col gap-3 overflow-y-auto px-2 py-2">
@@ -69,6 +110,49 @@ export default function ChatBubble({
                 </span>
               </div>
               <div className="whitespace-pre-wrap">{msg.content}</div>
+
+              {/* Executed actions chip row (assistant only) */}
+              {!isUser && msg.executedActions && msg.executedActions.length > 0 && (
+                <div className="mt-2 flex flex-wrap gap-1.5">
+                  {msg.executedActions.map((a, idx) => {
+                    const label = chipLabel(a);
+                    const canOpen = a.ok && !!a.todoId;
+                    const commonClass =
+                      "inline-flex items-center gap-1 rounded-md border border-glass-border px-2 py-0.5 text-[10px]";
+                    if (!a.ok) {
+                      return (
+                        <span
+                          key={idx}
+                          className={`${commonClass} text-red-400`}
+                          title={a.error}
+                        >
+                          <XCircle className="h-2.5 w-2.5" />
+                          {label}
+                        </span>
+                      );
+                    }
+                    if (canOpen) {
+                      return (
+                        <button
+                          key={idx}
+                          onClick={() => onOpenDetail?.(a.todoId!)}
+                          className={`${commonClass} text-text-muted transition-colors hover:text-text-secondary`}
+                          aria-label={label}
+                        >
+                          <ChipIcon type={a.type} />
+                          {label}
+                        </button>
+                      );
+                    }
+                    return (
+                      <span key={idx} className={`${commonClass} text-text-muted`}>
+                        <ChipIcon type={a.type} />
+                        {label}
+                      </span>
+                    );
+                  })}
+                </div>
+              )}
 
               {/* Actions for AI messages */}
               {!isUser && (
@@ -130,7 +214,7 @@ export default function ChatBubble({
               <span className="text-[10px] font-medium text-text-muted">AI 助手</span>
             </div>
             <div className="whitespace-pre-wrap">
-              {streamingContent}
+              {visibleStreaming}
               <span className="inline-block h-4 w-0.5 animate-pulse bg-accent align-middle" />
             </div>
           </div>
